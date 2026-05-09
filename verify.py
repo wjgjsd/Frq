@@ -35,7 +35,7 @@ def verify():
     vdsr_model.eval()
 
     freq_model = FreqUNet(in_channels=8, out_channels=3).to(device)
-    freq_model.load_state_dict(torch.load("./weights/frequnet_epoch_50.pth", map_location=device))
+    freq_model.load_state_dict(torch.load("./weights/frequnet_epoch_100.pth", map_location=device))
     freq_model.eval()
 
     # Load an unseen HR Image (Validation set)

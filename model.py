@@ -47,63 +47,50 @@ class CBAM(nn.Module):
         out = out * self.sa(out)
         return out
 
-class ResidualBlock(nn.Module):
-    """Residual Block with CBAM (in_channels -> out_channels)"""
+class DoubleConv(nn.Module):
+    """(Conv => BatchNorm => ReLU) * 2 + CBAM"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv_block = nn.Sequential(
+        self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels)
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         )
         self.cbam = CBAM(out_channels)
-        
-        # Skip connection 1x1 conv if dimensions change
-        if in_channels != out_channels:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
-        else:
-            self.skip = nn.Identity()
-            
-        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        identity = self.skip(x)
-        out = self.conv_block(x)
-        out = self.cbam(out)
-        out += identity
-        out = self.relu(out)
-        return out
+        x = self.double_conv(x)
+        x = self.cbam(x)
+        return x
 
 class FreqUNet(nn.Module):
     def __init__(self, in_channels=8, out_channels=3):
         super(FreqUNet, self).__init__()
         
-        # 깊이(Depth) 4 + CBAM Attention + Residual Blocks
+        # 깊이(Depth) 4 + CBAM Attention
         
         # 인코더 (Downsampling)
-        self.inc = ResidualBlock(in_channels, 64)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(64, 128))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(128, 256))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(256, 512))
-        self.down4 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(512, 1024))
+        self.inc = DoubleConv(in_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(512, 1024))
         
         # 디코더 (Upsampling)
         self.up1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.conv1 = ResidualBlock(1024, 512) # skip connection 512 + 512
+        self.conv1 = DoubleConv(1024, 512) # skip connection 512 + 512
         
         self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.conv2 = ResidualBlock(512, 256)  # skip connection 256 + 256
+        self.conv2 = DoubleConv(512, 256)  # skip connection 256 + 256
         
         self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.conv3 = ResidualBlock(256, 128)  # skip connection 128 + 128
+        self.conv3 = DoubleConv(256, 128)  # skip connection 128 + 128
         
         self.up4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv4 = ResidualBlock(128, 64)   # skip connection 64 + 64
+        self.conv4 = DoubleConv(128, 64)   # skip connection 64 + 64
         
         # 마지막 출력층
         self.outc = nn.Conv2d(64, out_channels, kernel_size=1)

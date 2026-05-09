@@ -38,7 +38,7 @@ def evaluate():
 
     # 기존의 LR + SR 기반 8채널 예측 모델 로드
     freq_model = FreqUNet(in_channels=8, out_channels=3).to(device)
-    freq_model.load_state_dict(torch.load("./weights/frequnet_epoch_50.pth", map_location=device))
+    freq_model.load_state_dict(torch.load("./weights/frequnet_epoch_100.pth", map_location=device))
     freq_model.eval()
 
     # Get all validation HR images
