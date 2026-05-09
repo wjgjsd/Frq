@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv1(x_cat)
+        return self.sigmoid(out)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        out = out * self.sa(out)
+        return out
+
+class ResidualBlock(nn.Module):
+    """Residual Block with CBAM (in_channels -> out_channels)"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        self.cbam = CBAM(out_channels)
+        
+        # Skip connection 1x1 conv if dimensions change
+        if in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.skip = nn.Identity()
+            
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = self.skip(x)
+        out = self.conv_block(x)
+        out = self.cbam(out)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class FreqUNet(nn.Module):
+    def __init__(self, in_channels=8, out_channels=3):
+        super(FreqUNet, self).__init__()
+        
+        # 깊이(Depth) 4 + CBAM Attention + Residual Blocks
+        
+        # 인코더 (Downsampling)
+        self.inc = ResidualBlock(in_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(256, 512))
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), ResidualBlock(512, 1024))
+        
+        # 디코더 (Upsampling)
+        self.up1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.conv1 = ResidualBlock(1024, 512) # skip connection 512 + 512
+        
+        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv2 = ResidualBlock(512, 256)  # skip connection 256 + 256
+        
+        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv3 = ResidualBlock(256, 128)  # skip connection 128 + 128
+        
+        self.up4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv4 = ResidualBlock(128, 64)   # skip connection 64 + 64
+        
+        # 마지막 출력층
+        self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # 인코딩
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        
+        # 디코딩
+        x = self.up1(x5)
+        x = torch.cat([x4, x], dim=1) # Skip connection
+        x = self.conv1(x)
+        
+        x = self.up2(x)
+        x = torch.cat([x3, x], dim=1) # Skip connection
+        x = self.conv2(x)
+        
+        x = self.up3(x)
+        x = torch.cat([x2, x], dim=1) # Skip connection
+        x = self.conv3(x)
+        
+        x = self.up4(x)
+        x = torch.cat([x1, x], dim=1) # Skip connection
+        x = self.conv4(x)
+        
+        output = self.outc(x)
+        return output
+
+if __name__ == "__main__":
+    # 구조 테스트
+    model = FreqUNet(in_channels=8, out_channels=3)
+    dummy_input = torch.randn(2, 8, 128, 128)
+    output = model(dummy_input)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {output.shape}")
+    print("FreqUNet (CBAM + Depth 4) 구조 정상!")

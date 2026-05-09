@@ -1,0 +1,9 @@
+data/
+weights/
+weights_lr_only/
+__pycache__/
+*.pth
+*.pt
+.DS_Store
+eval_results.txt
+eval_results_8ch.txt
