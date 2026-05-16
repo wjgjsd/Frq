@@ -1,0 +1,6 @@
+numpy
+matplotlib
+pillow
+PyWavelets
+tqdm
+opencv-python
