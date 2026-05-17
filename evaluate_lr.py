@@ -1,7 +1,5 @@
 import os
-import sys
 import glob
-import importlib.util
 from PIL import Image
 import torch
 from torchvision import transforms
@@ -11,140 +9,93 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
-# 1. Load LRFreqUNet
 from model_lr import LRFreqUNet
-
-# 2. Load VDSR safely to avoid model.py collision
-spec = importlib.util.spec_from_file_location("vdsr_model", "../VDSR/model.py")
-vdsr_module = importlib.util.module_from_spec(spec)
-sys.modules["vdsr_model"] = vdsr_module
-spec.loader.exec_module(vdsr_module)
-VDSR = vdsr_module.VDSR
 
 def extract_wavelet_numpy(img_gray):
     coeffs2 = pywt.dwt2(img_gray, 'haar')
     LL, (LH, HL, HH) = coeffs2
     return LL, LH, HL, HH
 
-def evaluate():
+def evaluate_lr():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Load Models
-    print("Loading models...")
-    vdsr_model = VDSR(in_channels=3).to(device)
-    vdsr_model.load_state_dict(torch.load("../VDSR/weights/vdsr_epoch_100.pth", map_location=device))
-    vdsr_model.eval()
+    # Load Model
+    model = LRFreqUNet(in_channels=4, out_channels=3).to(device)
+    weight_path = "./weights_lr_only/lr_only_epoch_100.pth"
+    if not os.path.exists(weight_path):
+        pth_files = glob.glob("./weights_lr_only/lr_only_epoch_*.pth")
+        if pth_files:
+            weight_path = sorted(pth_files)[-1]
+            print(f"Loading latest weights: {weight_path}")
+        else:
+            print("No weights found for Scenario 1.")
+            return
+    model.load_state_dict(torch.load(weight_path, map_location=device))
+    model.eval()
 
-    freq_model = LRFreqUNet(in_channels=4, out_channels=3).to(device)
-    freq_model.load_state_dict(torch.load("./weights_lr_only/lrfrequnet_epoch_50.pth", map_location=device))
-    freq_model.eval()
-
-    # Get all validation HR images
-    valid_dir = "../VDSR/DIV2K/DIV2K_valid_HR/"
-    image_paths = sorted(glob.glob(os.path.join(valid_dir, "*.png")))
+    # Valid images
+    valid_hr_dir = "./DIV2K/DIV2K_valid_HR/"
+    valid_lr_dir = "./DIV2K/DIV2K_valid_LR_bicubic/X4/"
     
-    if not image_paths:
-        print(f"No validation images found in {valid_dir}")
-        return
-        
-    print(f"Found {len(image_paths)} validation images. Starting evaluation...")
+    hr_paths = sorted(glob.glob(os.path.join(valid_hr_dir, "*.png")))
+    lr_paths = sorted(glob.glob(os.path.join(valid_lr_dir, "*.png")))
     
-    # 누적 점수 저장용 딕셔너리
+    print(f"Evaluating Scenario 1 with {len(hr_paths)} images...")
+    
     metrics = {
-        'lr_psnr': 0.0, 'lr_ssim': 0.0,
-        'vdsr_psnr': 0.0, 'vdsr_ssim': 0.0,
-        'recon_lr_psnr': 0.0, 'recon_lr_ssim': 0.0,
-        'recon_sr_psnr': 0.0, 'recon_sr_ssim': 0.0
+        'bicubic_psnr': 0.0, 'bicubic_ssim': 0.0,
+        'our_psnr': 0.0, 'our_ssim': 0.0
     }
     
-    for img_path in tqdm(image_paths, desc="Evaluating"):
-        hr_img = Image.open(img_path).convert("RGB")
+    for hr_path, lr_path in tqdm(zip(hr_paths, lr_paths), total=len(hr_paths)):
+        hr_img = Image.open(hr_path).convert("L")
+        lr_img = Image.open(lr_path).convert("L")
         
-        # 전처리 (가로, 세로 길이를 256의 배수로 맞춰 비교)
         w, h = hr_img.size
-        new_w = w - (w % 256)
-        new_h = h - (h % 256)
+        # First, upscale LR to full HR size to maintain alignment
+        lr_img_up_full = lr_img.resize((w, h), Image.BICUBIC)
         
-        # 너무 작은 이미지는 패스
-        if new_w < 256 or new_h < 256:
-            continue
-            
-        hr_img = hr_img.crop((0, 0, new_w, new_h))
+        # Then, crop both using same coordinates
+        new_w, new_h = w - (w % 256), h - (h % 256)
+        if new_w < 256 or new_h < 256: continue
         
-        # Create LR by Downsampling (Bicubic, 1/4 size)
-        lr_w, lr_h = new_w // 4, new_h // 4
-        lr_img_small = hr_img.resize((lr_w, lr_h), Image.BICUBIC)
+        hr_img_cropped = hr_img.crop((0, 0, new_w, new_h))
+        lr_img_cropped = lr_img_up_full.crop((0, 0, new_w, new_h))
         
-        # 1. Bicubic Upsampling
-        lr_img_upsampled = lr_img_small.resize((new_w, new_h), Image.BICUBIC)
+        hr_gray = np.array(hr_img_cropped).astype(np.float32) / 255.0
+        lr_gray = np.array(lr_img_cropped).astype(np.float32) / 255.0
         
-        # 2. VDSR Super Resolution
-        lr_tensor = transforms.ToTensor()(lr_img_upsampled).unsqueeze(0).to(device)
-        with torch.no_grad():
-            _, sr_tensor = vdsr_model(lr_tensor)
-        sr_img = transforms.ToPILImage()(sr_tensor.squeeze(0).cpu().clamp(0, 1))
-        
-        # 변환 (Grayscale for Frequency Analysis)
-        lr_gray = np.array(lr_img_upsampled.convert("L")).astype(np.float32) / 255.0
-        sr_gray = np.array(sr_img.convert("L")).astype(np.float32) / 255.0
-        hr_gray = np.array(hr_img.convert("L")).astype(np.float32) / 255.0
-        
-        # 3. Wavelet Transform
-        lr_ll, lr_lh, lr_hl, lr_hh = extract_wavelet_numpy(lr_gray)
-        sr_ll, sr_lh, sr_hl, sr_hh = extract_wavelet_numpy(sr_gray)
-        
-        # 모델에 넣기 위해 텐서로 변환 (오직 LR 정보만: Batch=1, Channels=4)
+        # Wavelet for Input
+        ll, lh, hl, hh = extract_wavelet_numpy(lr_gray)
         input_tensor = torch.cat([
-            torch.from_numpy(lr_ll).unsqueeze(0), torch.from_numpy(lr_lh).unsqueeze(0),
-            torch.from_numpy(lr_hl).unsqueeze(0), torch.from_numpy(lr_hh).unsqueeze(0)
+            torch.from_numpy(ll).unsqueeze(0), torch.from_numpy(lh).unsqueeze(0),
+            torch.from_numpy(hl).unsqueeze(0), torch.from_numpy(hh).unsqueeze(0)
         ], dim=0).unsqueeze(0).to(device)
         
-        # 고주파수 예측
+        # Predict HF
         with torch.no_grad():
-            pred_high_freq = freq_model(input_tensor).squeeze(0).cpu() # [3, W/2, H/2]
+            pred_hf = model(input_tensor).squeeze(0).cpu().numpy()
             
-        pred_lh = pred_high_freq[0].numpy()
-        pred_hl = pred_high_freq[1].numpy()
-        pred_hh = pred_high_freq[2].numpy()
+        # Recon
+        recon_coeffs = (ll, (pred_hf[0], pred_hf[1], pred_hf[2]))
+        recon_gray = pywt.idwt2(recon_coeffs, 'haar')
+        recon_gray = np.clip(recon_gray, 0, 1)
         
-        # IDWT (역 웨이블릿 변환) 1: SR(VDSR)의 저주파수(LL) + 예측 고주파수
-        recon_coeffs_sr = (sr_ll, (pred_lh, pred_hl, pred_hh))
-        recon_gray_sr = pywt.idwt2(recon_coeffs_sr, 'haar')
-        recon_gray_sr = np.clip(recon_gray_sr, 0, 1)
+        # Metrics
+        metrics['bicubic_psnr'] += psnr(hr_gray, lr_gray, data_range=1.0)
+        metrics['bicubic_ssim'] += ssim(hr_gray, lr_gray, data_range=1.0)
+        metrics['our_psnr'] += psnr(hr_gray, recon_gray, data_range=1.0)
+        metrics['our_ssim'] += ssim(hr_gray, recon_gray, data_range=1.0)
         
-        # IDWT (역 웨이블릿 변환) 2: 오직 LR의 저주파수(LL) + 예측 고주파수
-        recon_coeffs_lr = (lr_ll, (pred_lh, pred_hl, pred_hh))
-        recon_gray_lr = pywt.idwt2(recon_coeffs_lr, 'haar')
-        recon_gray_lr = np.clip(recon_gray_lr, 0, 1)
-        
-        # 정량적 평가 (PSNR, SSIM 계산) 누적
-        metrics['lr_psnr'] += psnr(hr_gray, lr_gray, data_range=1.0)
-        metrics['lr_ssim'] += ssim(hr_gray, lr_gray, data_range=1.0)
-        
-        metrics['vdsr_psnr'] += psnr(hr_gray, sr_gray, data_range=1.0)
-        metrics['vdsr_ssim'] += ssim(hr_gray, sr_gray, data_range=1.0)
-        
-        metrics['recon_lr_psnr'] += psnr(hr_gray, recon_gray_lr, data_range=1.0)
-        metrics['recon_lr_ssim'] += ssim(hr_gray, recon_gray_lr, data_range=1.0)
-        
-        metrics['recon_sr_psnr'] += psnr(hr_gray, recon_gray_sr, data_range=1.0)
-        metrics['recon_sr_ssim'] += ssim(hr_gray, recon_gray_sr, data_range=1.0)
-
-    # 평균 계산
-    num_images = len(image_paths)
-    for key in metrics:
-        metrics[key] /= num_images
-
-    # 결과 출력
+    num = len(hr_paths)
     print("\n" + "="*50)
-    print(f"🏆 DIV2K Validation Dataset Evaluation ({num_images} images) 🏆")
+    print(f"📊 Scenario 1 (LR-Only) Evaluation Result 📊")
     print("="*50)
-    print(f"[1] LR (Bicubic)      - PSNR: {metrics['lr_psnr']:.2f}dB, SSIM: {metrics['lr_ssim']:.4f}")
-    print(f"[2] VDSR SR           - PSNR: {metrics['vdsr_psnr']:.2f}dB, SSIM: {metrics['vdsr_ssim']:.4f}")
-    print(f"[3] Recon (LR_LL+Pred)- PSNR: {metrics['recon_lr_psnr']:.2f}dB, SSIM: {metrics['recon_lr_ssim']:.4f}")
-    print(f"[4] Recon (SR_LL+Pred)- PSNR: {metrics['recon_sr_psnr']:.2f}dB, SSIM: {metrics['recon_sr_ssim']:.4f}")
+    print(f"Bicubic Baseline - PSNR: {metrics['bicubic_psnr']/num:.2f}dB, SSIM: {metrics['bicubic_ssim']/num:.4f}")
+    print(f"Our Model (Freq) - PSNR: {metrics['our_psnr']/num:.2f}dB, SSIM: {metrics['our_ssim']/num:.4f}")
+    print(f"Improvement over Bicubic: { (metrics['our_psnr'] - metrics['bicubic_psnr'])/num:+.4f} dB")
     print("="*50)
 
 if __name__ == "__main__":
-    evaluate()
+    evaluate_lr()

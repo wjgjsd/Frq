@@ -1,121 +1,125 @@
 import os
+import json
+import glob
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 from dataset_lr import LRFreqDataset
 from model_lr import LRFreqUNet
 
-def train():
-    # 1. 디바이스 설정
+# Differentiable Haar IDWT
+class HaarIDWT(nn.Module):
+    def __init__(self):
+        super(HaarIDWT, self).__init__()
+        kernel = torch.tensor([
+            [[[1, 1], [1, 1]]],
+            [[[1, -1], [1, -1]]],
+            [[[1, 1], [-1, -1]]],
+            [[[1, -1], [-1, 1]]]
+        ]).float() / 2.0
+        self.register_buffer('kernel', kernel)
+
+    def forward(self, LL, LH, HL, HH):
+        x = torch.cat([LL, LH, HL, HH], dim=1)
+        return F.conv_transpose2d(x, self.kernel, stride=2, groups=1)
+
+def compute_ssim(img1, img2, window_size=11):
+    C1, C2 = 0.01**2, 0.03**2
+    mu1 = F.avg_pool2d(img1, window_size, stride=1, padding=window_size//2)
+    mu2 = F.avg_pool2d(img2, window_size, stride=1, padding=window_size//2)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+    sigma1_sq = F.avg_pool2d(img1 * img1, window_size, stride=1, padding=window_size//2) - mu1_sq
+    sigma2_sq = F.avg_pool2d(img2 * img2, window_size, stride=1, padding=window_size//2) - mu2_sq
+    sigma12 = F.avg_pool2d(img1 * img2, window_size, stride=1, padding=window_size//2) - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+
+class Scenario1Loss(nn.Module):
+    def __init__(self, w_freq=1.0, w_img=1.0, w_ssim=0.5):
+        super().__init__()
+        self.w_freq, self.w_img, self.w_ssim = w_freq, w_img, w_ssim
+        self.l1 = nn.L1Loss()
+        self.idwt = HaarIDWT()
+
+    def forward(self, pred_hf, target_hf, lr_ll):
+        loss_freq = self.l1(pred_hf, target_hf)
+        recon_img = self.idwt(lr_ll, pred_hf[:, 0:1, ...], pred_hf[:, 1:2, ...], pred_hf[:, 2:3, ...])
+        recon_img = torch.clamp(recon_img, 0, 1)
+        target_img = self.idwt(lr_ll, target_hf[:, 0:1, ...], target_hf[:, 1:2, ...], target_hf[:, 2:3, ...])
+        target_img = torch.clamp(target_img, 0, 1)
+        loss_img = self.l1(recon_img, target_img)
+        loss_ssim = 1 - compute_ssim(recon_img, target_img)
+        return self.w_freq * loss_freq + self.w_img * loss_img + self.w_ssim * loss_ssim, loss_freq, loss_img, loss_ssim
+
+def train_lr():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 2. 하이퍼파라미터 설정
-    batch_size = 32
+    # Updated Hyperparameters for Faster Training
+    batch_size = 64 # Increased from 32
     learning_rate = 1e-4
-    num_epochs = 50
-    data_dir = "./data/train"
+    num_epochs = 100
+    data_dir = "./data_lr/train"
     weights_dir = "./weights_lr_only"
-    
     os.makedirs(weights_dir, exist_ok=True)
 
-    # 3. 데이터셋 로드
-    print("Loading LR-only dataset...")
-    try:
-        dataset = LRFreqDataset(data_dir=data_dir)
-        print(f"Total training patches: {len(dataset)}")
-        if len(dataset) == 0:
-            raise ValueError("Dataset is empty.")
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        print("Please run 'python prepare_dataset.py' first to generate the data.")
-        return
-
+    print("Loading Scenario 1 dataset...")
+    dataset = LRFreqDataset(data_dir=data_dir)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
-    # 4. 모델 및 Loss 초기화 (in_channels=4)
     model = LRFreqUNet(in_channels=4, out_channels=3).to(device)
-    
-    # 가중치 주파수 손실 (Weighted Frequency Loss)
-    # HH 밴드(대각선 초고주파수)가 가장 맞추기 어려우므로 틀렸을 때 벌점을 2배로 부여합니다.
-    class WeightedWaveletLoss(nn.Module):
-        def __init__(self, w_lh=1.0, w_hl=1.0, w_hh=2.0):
-            super().__init__()
-            self.w_lh = w_lh
-            self.w_hl = w_hl
-            self.w_hh = w_hh
-            self.l1 = nn.L1Loss()
-            
-        def forward(self, pred, target):
-            # Channels: 0=LH, 1=HL, 2=HH
-            loss_lh = self.l1(pred[:, 0, ...], target[:, 0, ...])
-            loss_hl = self.l1(pred[:, 1, ...], target[:, 1, ...])
-            loss_hh = self.l1(pred[:, 2, ...], target[:, 2, ...])
-            return self.w_lh * loss_lh + self.w_hl * loss_hl + self.w_hh * loss_hh
-
-    criterion = WeightedWaveletLoss(w_lh=1.0, w_hl=1.0, w_hh=2.0)
+    criterion = Scenario1Loss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Resume Logic
+    start_epoch = 0
+    checkpoint_list = glob.glob(os.path.join(weights_dir, "lr_only_epoch_*.pth"))
+    if checkpoint_list:
+        latest_checkpoint = max(checkpoint_list, key=os.path.getctime)
+        print(f"Resuming from checkpoint: {latest_checkpoint}")
+        model.load_state_dict(torch.load(latest_checkpoint))
+        start_epoch = int(os.path.basename(latest_checkpoint).split('_')[-1].split('.')[0])
+        print(f"Starting from epoch {start_epoch + 1}")
 
-    # 5. 학습 루프
-    print("Starting LR-Only training...")
+    print(f"Starting training (Scenario 1: LR-Only, Batch Size: {batch_size})...")
     loss_history = []
     
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         epoch_loss = 0.0
         
         for batch_idx, (inputs, targets) in enumerate(dataloader):
             inputs, targets = inputs.to(device), targets.to(device)
+            lr_ll = inputs[:, 0:1, ...]
             
-            # Forward
             optimizer.zero_grad()
-            outputs = model(inputs)
+            pred_hf = model(inputs)
             
-            # Loss 계산
-            loss = criterion(outputs, targets)
-            
-            # Backward
+            loss, l_f, l_i, l_s = criterion(pred_hf, targets, lr_ll)
             loss.backward()
             optimizer.step()
             
             epoch_loss += loss.item()
             
-            if (batch_idx + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}] Batch [{batch_idx+1}/{len(dataloader)}] Loss: {loss.item():.6f}")
+            if (batch_idx + 1) % 20 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}] Batch [{batch_idx+1}/{len(dataloader)}] "
+                      f"Loss: {loss.item():.4f} (F:{l_f.item():.4f}, I:{l_i.item():.4f}, S:{l_s.item():.4f})")
                 
         avg_loss = epoch_loss / len(dataloader)
         loss_history.append(avg_loss)
         print(f"===> Epoch {epoch+1} Complete. Average Loss: {avg_loss:.6f}")
         
-        # 주기적으로 모델 가중치 저장
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == num_epochs:
-            save_path = os.path.join(weights_dir, f"lrfrequnet_epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), save_path)
-            print(f"Saved model to {save_path}\n")
+        if (epoch + 1) % 10 == 0:
+            torch.save(model.state_dict(), os.path.join(weights_dir, f"lr_only_epoch_{epoch+1}.pth"))
 
-    # 6. 학습 완료 후 Loss 그래프 저장
-    print("Training finished. Saving loss history and plot...")
-    import json
-    import matplotlib.pyplot as plt
-    
-    # Loss 기록 텍스트 파일로 저장
-    history_path = os.path.join(weights_dir, "loss_history_lr.json")
+    # Save results
+    history_path = os.path.join(weights_dir, "loss_history.json")
     with open(history_path, 'w') as f:
         json.dump(loss_history, f)
-        
-    # Loss 그래프 이미지로 저장
-    plt.figure(figsize=(10, 5))
-    plt.plot(range(1, num_epochs + 1), loss_history, marker='o', linestyle='-', color='r')
-    plt.title('LR-Only Training Loss Over Epochs')
-    plt.xlabel('Epoch')
-    plt.ylabel('Average Loss')
-    plt.grid(True)
-    plt.tight_layout()
-    plot_path = os.path.join(weights_dir, "loss_curve_lr.png")
-    plt.savefig(plot_path)
-    print(f"Loss history saved to {history_path}")
-    print(f"Loss curve plot saved to {plot_path}")
+    print("Scenario 1 training finished.")
 
 if __name__ == "__main__":
-    train()
+    train_lr()

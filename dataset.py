@@ -55,11 +55,12 @@ class FreqDataset(Dataset):
             sr_wt['LL'], sr_wt['LH'], sr_wt['HL'], sr_wt['HH']
         ], dim=0)
         
-        # 예측 타겟 (Target): HR 고주파수 직접 예측 (잔차 학습 제거)
+        # 예측 타겟 (Target): HR과 SR 고주파수의 차이 (Residual Learning)
+        # SR이 놓친 부분을 학습하도록 설정
         target_tensor = torch.cat([
-            hr_wt['LH'], 
-            hr_wt['HL'], 
-            hr_wt['HH']
+            hr_wt['LH'] - sr_wt['LH'], 
+            hr_wt['HL'] - sr_wt['HL'], 
+            hr_wt['HH'] - sr_wt['HH']
         ], dim=0)
         
         return input_tensor, target_tensor
