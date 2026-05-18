@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from dataset_lr import LRFreqDataset
-from model_lr import LRFreqUNet
+from model_lr import LRFreqUNet, FreqResNet
 
 # Differentiable Haar IDWT
 class HaarIDWT(nn.Module):
@@ -58,21 +58,22 @@ def train_lr():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Updated Hyperparameters for Faster Training
-    batch_size = 64 # Increased from 32
+    # Hyperparameters for FreqResNet
+    batch_size = 32
     learning_rate = 1e-4
     num_epochs = 100
     data_dir = "./data_lr/train"
-    weights_dir = "./weights_lr_only"
+    weights_dir = "./weights_lr_resnet"
     os.makedirs(weights_dir, exist_ok=True)
 
     print("Loading Scenario 1 dataset...")
     dataset = LRFreqDataset(data_dir=data_dir)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
-    model = LRFreqUNet(in_channels=4, out_channels=3).to(device)
+    model = FreqResNet(in_channels=4, out_channels=3).to(device)
     criterion = Scenario1Loss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     
     # Resume Logic
     start_epoch = 0
@@ -82,10 +83,21 @@ def train_lr():
         print(f"Resuming from checkpoint: {latest_checkpoint}")
         model.load_state_dict(torch.load(latest_checkpoint))
         start_epoch = int(os.path.basename(latest_checkpoint).split('_')[-1].split('.')[0])
+        # Fast-forward scheduler
+        for _ in range(start_epoch):
+            scheduler.step()
         print(f"Starting from epoch {start_epoch + 1}")
 
-    print(f"Starting training (Scenario 1: LR-Only, Batch Size: {batch_size})...")
+    # Load previous history if exists
+    history_path = os.path.join(weights_dir, "loss_history.json")
     loss_history = []
+    if os.path.exists(history_path) and start_epoch > 0:
+        with open(history_path, 'r') as f:
+            loss_history = json.load(f)
+            
+    best_loss = min(loss_history) if loss_history else float('inf')
+
+    print(f"Starting training (FreqResNet, Batch Size: {batch_size})...")
     
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -106,19 +118,28 @@ def train_lr():
             
             if (batch_idx + 1) % 20 == 0:
                 print(f"Epoch [{epoch+1}/{num_epochs}] Batch [{batch_idx+1}/{len(dataloader)}] "
-                      f"Loss: {loss.item():.4f} (F:{l_f.item():.4f}, I:{l_i.item():.4f}, S:{l_s.item():.4f})")
+                      f"LR: {scheduler.get_last_lr()[0]:.2e} Loss: {loss.item():.4f} (F:{l_f.item():.4f}, I:{l_i.item():.4f}, S:{l_s.item():.4f})")
                 
+        scheduler.step()
+        
         avg_loss = epoch_loss / len(dataloader)
         loss_history.append(avg_loss)
         print(f"===> Epoch {epoch+1} Complete. Average Loss: {avg_loss:.6f}")
         
+        # Save Best Model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            print(f"🌟 New Best Loss: {best_loss:.6f}! Saving model...")
+            torch.save(model.state_dict(), os.path.join(weights_dir, "lr_only_best.pth"))
+        
+        # Save Checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), os.path.join(weights_dir, f"lr_only_epoch_{epoch+1}.pth"))
 
-    # Save results
-    history_path = os.path.join(weights_dir, "loss_history.json")
-    with open(history_path, 'w') as f:
-        json.dump(loss_history, f)
+        # Save history every epoch
+        with open(history_path, 'w') as f:
+            json.dump(loss_history, f)
+            
     print("Scenario 1 training finished.")
 
 if __name__ == "__main__":

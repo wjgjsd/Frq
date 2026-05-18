@@ -123,11 +123,64 @@ class LRFreqUNet(nn.Module):
         output = self.outc(x)
         return output
 
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.cbam = CBAM(channels)
+
+    def forward(self, x):
+        res = self.conv1(x)
+        res = self.relu(res)
+        res = self.conv2(res)
+        res = self.cbam(res)
+        return x + res
+
+class FreqResNet(nn.Module):
+    def __init__(self, in_channels=4, out_channels=3, num_blocks=16, base_channels=64):
+        super(FreqResNet, self).__init__()
+        
+        # Initial Feature Extraction
+        self.head = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        
+        # Residual Blocks
+        self.body = nn.Sequential(*[ResBlock(base_channels) for _ in range(num_blocks)])
+        
+        # Final Convolution
+        self.tail = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        # x is [B, 4, H/2, W/2] : (LL, LH, HL, HH)
+        # We want to predict HR HF (LH, HL, HH)
+        
+        # Extract features
+        feat = self.head(x)
+        
+        # Deep mapping
+        res = self.body(feat)
+        res = res + feat # Global residual connection for features
+        
+        # Final output
+        out = self.tail(res)
+        
+        # Global Skip Connection (Add input HF to predicted HF)
+        # x[:, 1:4] corresponds to LR's LH, HL, HH
+        return out + x[:, 1:4, :, :]
+
 if __name__ == "__main__":
     # 구조 테스트
     model = LRFreqUNet(in_channels=4, out_channels=3)
     dummy_input = torch.randn(2, 4, 128, 128)
     output = model(dummy_input)
-    print(f"Input shape: {dummy_input.shape}")
-    print(f"Output shape: {output.shape}")
-    print("LRFreqUNet (LR-Only 4-channels) 구조 정상!")
+    print(f"LRFreqUNet Output shape: {output.shape}")
+    
+    model2 = FreqResNet()
+    output2 = model2(dummy_input)
+    print(f"FreqResNet Output shape: {output2.shape}")
+    print("Models 구조 정상!")
