@@ -8,7 +8,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
-from model_lr import LRFreqUNet, FreqResNet
+from model_lr import LRFreqUNet, FreqResNet, FreqRDN
 
 def extract_wavelet_numpy(img_gray):
     coeffs2 = pywt.dwt2(img_gray, 'haar')
@@ -74,25 +74,19 @@ def evaluate_on_dataset(model, device, dataset_dir, scale=4):
             torch.from_numpy(hl).unsqueeze(0), torch.from_numpy(hh).unsqueeze(0)
         ], dim=0).unsqueeze(0).to(device)
         
-        # Predict HF
+        # Inference
         with torch.no_grad():
-            pred_hf = model(input_tensor).squeeze(0).cpu().numpy()
+            pred_hf = model(input_tensor)
             
-        # Recon (Grayscale)
-        recon_coeffs = (ll, (pred_hf[0], pred_hf[1], pred_hf[2]))
-        recon_gray = pywt.idwt2(recon_coeffs, 'haar')
-        recon_gray = np.clip(recon_gray, 0, 1)
+        pred_LH = pred_hf[:, 0, ...].cpu().numpy()[0]
+        pred_HL = pred_hf[:, 1, ...].cpu().numpy()[0]
+        pred_HH = pred_hf[:, 2, ...].cpu().numpy()[0]
         
-        # For standard metrics, we need the RGB images to convert to Y channel.
-        # Since our model only predicted Grayscale (L channel), we will inject this back into YCbCr 
-        # or calculate PSNR purely on the predicted Grayscale output vs HR Grayscale.
-        # However, to be perfectly fair with the paper, the standard protocol assumes full RGB SR output,
-        # then converts to YCbCr.
-        # Our model is a Grayscale model. So we calculate Y-channel equivalent metrics by extracting
-        # the Y channel from the original HR, and comparing it to our model's output (which acts as Y).
+        # IDWT
+        coeffs_recon = (ll, (pred_LH, pred_HL, pred_HH))
+        recon_gray = pywt.idwt2(coeffs_recon, 'haar')
+        recon_gray = np.clip(recon_gray, 0.0, 1.0)
         
-        # Extract Standard Y-Channel from Ground Truth
-        hr_rgb_arr = np.array(hr_img_cropped).astype(np.float32) / 255.0
         # The model was trained on PIL "L" Grayscale. 
         # Evaluating PIL "L" against MATLAB "Y" causes a massive PSNR drop due to color space scale differences.
         # To evaluate fairly, we must compare the model's output to the PIL "L" ground truth.
@@ -121,29 +115,38 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Check if FreqResNet exists in weights
-    use_resnet = False
-    weight_path = "./weights_lr_resnet/lr_only_best.pth"
+    # Check if FreqRDN exists in weights
+    use_rdn = False
+    weight_path = "./weights_lr_rdn/lr_only_best.pth"
     if not os.path.exists(weight_path):
-        weight_path = "./weights_lr_resnet/lr_only_epoch_100.pth"
+        weight_path = "./weights_lr_rdn/lr_only_epoch_100.pth"
         if not os.path.exists(weight_path):
-            pth_files = glob.glob("./weights_lr_resnet/lr_only_epoch_*.pth")
+            pth_files = glob.glob("./weights_lr_rdn/lr_only_epoch_*.pth")
             if pth_files:
                 weight_path = sorted(pth_files, key=os.path.getctime)[-1]
                 print(f"Loading latest weights: {weight_path}")
             else:
-                print("No weights found.")
-                return
+                # Fallback to FreqResNet
+                weight_path = "./weights_lr_resnet/lr_only_best.pth"
+                if not os.path.exists(weight_path):
+                    weight_path = "./weights_lr_resnet/lr_only_epoch_100.pth"
 
-    # To support both models for testing, we try loading FreqResNet first
+    # To support both models for testing, we try loading FreqRDN first
     try:
-        model = FreqResNet(in_channels=4, out_channels=3).to(device)
+        model = FreqRDN(in_channels=4, out_channels=3).to(device)
         model.load_state_dict(torch.load(weight_path, map_location=device))
-        print("Successfully loaded FreqResNet.")
+        print("Successfully loaded FreqRDN.")
     except Exception as e:
-        print("Falling back to LRFreqUNet.")
-        model = LRFreqUNet(in_channels=4, out_channels=3).to(device)
-        model.load_state_dict(torch.load(weight_path, map_location=device))
+        print(f"Failed to load FreqRDN: {e}")
+        try:
+            print("Falling back to FreqResNet.")
+            model = FreqResNet(in_channels=4, out_channels=3).to(device)
+            model.load_state_dict(torch.load(weight_path, map_location=device))
+        except Exception as e2:
+            print("Falling back to LRFreqUNet.")
+            weight_path = "./weights_lr_only/lr_only_epoch_100.pth"
+            model = LRFreqUNet(in_channels=4, out_channels=3).to(device)
+            model.load_state_dict(torch.load(weight_path, map_location=device))
 
     model.eval()
 

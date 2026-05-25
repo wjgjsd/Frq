@@ -173,6 +173,90 @@ class FreqResNet(nn.Module):
         # x[:, 1:4] corresponds to LR's LH, HL, HH
         return out + x[:, 1:4, :, :]
 
+class DenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super(DenseLayer, self).__init__()
+        self.conv = nn.Conv2d(in_channels, growth_rate, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        out = self.relu(self.conv(x))
+        return torch.cat([x, out], dim=1)
+
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, in_channels, growth_rate=32, num_layers=4):
+        super(ResidualDenseBlock, self).__init__()
+        self.layers = nn.ModuleList()
+        current_channels = in_channels
+        for _ in range(num_layers):
+            self.layers.append(DenseLayer(current_channels, growth_rate))
+            current_channels += growth_rate
+            
+        # Local Feature Fusion
+        self.lff = nn.Conv2d(current_channels, in_channels, kernel_size=1)
+        self.cbam = CBAM(in_channels)
+
+    def forward(self, x):
+        res = x
+        for layer in self.layers:
+            res = layer(res)
+        res = self.lff(res)
+        res = self.cbam(res)
+        return x + res
+
+class FreqRDN(nn.Module):
+    def __init__(self, in_channels=4, out_channels=3, num_blocks=8, base_channels=64, growth_rate=32):
+        super(FreqRDN, self).__init__()
+        
+        # Initial Feature Extraction
+        self.head = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        
+        # Residual Dense Blocks (RDB)
+        self.body = nn.Sequential(*[ResidualDenseBlock(base_channels, growth_rate) for _ in range(num_blocks)])
+        
+        # Global Feature Fusion (GFF)
+        self.gff = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Frequency-Aware Branches (Tail)
+        # 3 separate branches for LH, HL, HH to specialize in different edge directions
+        self.tail_LH = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
+        )
+        self.tail_HL = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
+        )
+        self.tail_HH = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        # Extract features
+        feat = self.head(x)
+        
+        # Deep mapping with dense connections
+        res = self.body(feat)
+        res = self.gff(res)
+        res = res + feat # Global feature skip connection
+        
+        # Frequency-aware reconstruction
+        out_LH = self.tail_LH(res)
+        out_HL = self.tail_HL(res)
+        out_HH = self.tail_HH(res)
+        
+        out = torch.cat([out_LH, out_HL, out_HH], dim=1)
+        
+        # Global HF Skip Connection (Residual Learning)
+        return out + x[:, 1:4, :, :]
+
 if __name__ == "__main__":
     # 구조 테스트
     model = LRFreqUNet(in_channels=4, out_channels=3)
@@ -183,4 +267,8 @@ if __name__ == "__main__":
     model2 = FreqResNet()
     output2 = model2(dummy_input)
     print(f"FreqResNet Output shape: {output2.shape}")
+    
+    model3 = FreqRDN()
+    output3 = model3(dummy_input)
+    print(f"FreqRDN Output shape: {output3.shape}")
     print("Models 구조 정상!")

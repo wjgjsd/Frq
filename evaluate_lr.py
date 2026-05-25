@@ -11,6 +11,14 @@ from tqdm import tqdm
 
 from model_lr import LRFreqUNet
 
+def shave(img, border):
+    """
+    Remove border pixels.
+    """
+    if border > 0:
+        return img[border:-border, border:-border]
+    return img
+
 def extract_wavelet_numpy(img_gray):
     coeffs2 = pywt.dwt2(img_gray, 'haar')
     LL, (LH, HL, HH) = coeffs2
@@ -82,11 +90,17 @@ def evaluate_lr():
         recon_gray = pywt.idwt2(recon_coeffs, 'haar')
         recon_gray = np.clip(recon_gray, 0, 1)
         
+        # Shaving (removing borders)
+        scale = 4
+        hr_shaved = shave(hr_gray, scale)
+        lr_shaved = shave(lr_gray, scale)
+        recon_shaved = shave(recon_gray, scale)
+        
         # Metrics
-        metrics['bicubic_psnr'] += psnr(hr_gray, lr_gray, data_range=1.0)
-        metrics['bicubic_ssim'] += ssim(hr_gray, lr_gray, data_range=1.0)
-        metrics['our_psnr'] += psnr(hr_gray, recon_gray, data_range=1.0)
-        metrics['our_ssim'] += ssim(hr_gray, recon_gray, data_range=1.0)
+        metrics['bicubic_psnr'] += psnr(hr_shaved, lr_shaved, data_range=1.0)
+        metrics['bicubic_ssim'] += ssim(hr_shaved, lr_shaved, data_range=1.0)
+        metrics['our_psnr'] += psnr(hr_shaved, recon_shaved, data_range=1.0)
+        metrics['our_ssim'] += ssim(hr_shaved, recon_shaved, data_range=1.0)
         
     num = len(hr_paths)
     print("\n" + "="*50)

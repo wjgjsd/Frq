@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from dataset_lr import LRFreqDataset
-from model_lr import LRFreqUNet, FreqResNet
+from model_lr import LRFreqUNet, FreqResNet, FreqRDN
 
 # Differentiable Haar IDWT
 class HaarIDWT(nn.Module):
@@ -37,40 +37,55 @@ def compute_ssim(img1, img2, window_size=11):
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
     return ssim_map.mean()
 
+class CharbonnierLoss(nn.Module):
+    def __init__(self, eps=1e-3):
+        super(CharbonnierLoss, self).__init__()
+        self.eps2 = eps ** 2
+
+    def forward(self, x, y):
+        diff = x - y
+        loss = torch.sqrt(diff * diff + self.eps2)
+        return torch.mean(loss)
+
 class Scenario1Loss(nn.Module):
     def __init__(self, w_freq=1.0, w_img=1.0, w_ssim=0.5):
         super().__init__()
         self.w_freq, self.w_img, self.w_ssim = w_freq, w_img, w_ssim
-        self.l1 = nn.L1Loss()
+        self.charbonnier = CharbonnierLoss()
         self.idwt = HaarIDWT()
 
     def forward(self, pred_hf, target_hf, lr_ll):
-        loss_freq = self.l1(pred_hf, target_hf)
+        # Charbonnier Loss for Frequency Domain
+        loss_freq = self.charbonnier(pred_hf, target_hf)
+        
         recon_img = self.idwt(lr_ll, pred_hf[:, 0:1, ...], pred_hf[:, 1:2, ...], pred_hf[:, 2:3, ...])
         recon_img = torch.clamp(recon_img, 0, 1)
         target_img = self.idwt(lr_ll, target_hf[:, 0:1, ...], target_hf[:, 1:2, ...], target_hf[:, 2:3, ...])
         target_img = torch.clamp(target_img, 0, 1)
-        loss_img = self.l1(recon_img, target_img)
+        
+        # Charbonnier Loss for Image Domain
+        loss_img = self.charbonnier(recon_img, target_img)
         loss_ssim = 1 - compute_ssim(recon_img, target_img)
+        
         return self.w_freq * loss_freq + self.w_img * loss_img + self.w_ssim * loss_ssim, loss_freq, loss_img, loss_ssim
 
 def train_lr():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Hyperparameters for FreqResNet
-    batch_size = 32
+    # Hyperparameters for FreqRDN
+    batch_size = 24 # RDN is heavier, recommend 16 to prevent OOM
     learning_rate = 1e-4
-    num_epochs = 100
+    num_epochs = 1000
     data_dir = "./data_lr/train"
-    weights_dir = "./weights_lr_resnet"
+    weights_dir = "./weights_lr_rdn"
     os.makedirs(weights_dir, exist_ok=True)
 
     print("Loading Scenario 1 dataset...")
     dataset = LRFreqDataset(data_dir=data_dir)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
 
-    model = FreqResNet(in_channels=4, out_channels=3).to(device)
+    model = FreqRDN(in_channels=4, out_channels=3).to(device)
     criterion = Scenario1Loss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)

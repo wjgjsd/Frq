@@ -47,87 +47,101 @@ class CBAM(nn.Module):
         out = out * self.sa(out)
         return out
 
-class DoubleConv(nn.Module):
-    """(Conv => BatchNorm => ReLU) * 2 + CBAM"""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+class DenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super(DenseLayer, self).__init__()
+        self.conv = nn.Conv2d(in_channels, growth_rate, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        out = self.relu(self.conv(x))
+        return torch.cat([x, out], dim=1)
+
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, in_channels, growth_rate=32, num_layers=4):
+        super(ResidualDenseBlock, self).__init__()
+        self.layers = nn.ModuleList()
+        current_channels = in_channels
+        for _ in range(num_layers):
+            self.layers.append(DenseLayer(current_channels, growth_rate))
+            current_channels += growth_rate
+            
+        # Local Feature Fusion
+        self.lff = nn.Conv2d(current_channels, in_channels, kernel_size=1)
+        self.cbam = CBAM(in_channels)
+
+    def forward(self, x):
+        res = x
+        for layer in self.layers:
+            res = layer(res)
+        res = self.lff(res)
+        res = self.cbam(res)
+        return x + res
+
+class FreqRDN_Refine(nn.Module):
+    """
+    Scenario 2 Model: Residual Refinement
+    Input: 8 Channels (LR_DWT + SR_Baseline_DWT)
+    Output: 3 Channels (Pred_Residual for LH, HL, HH)
+    """
+    def __init__(self, in_channels=8, out_channels=3, num_blocks=8, base_channels=64, growth_rate=32):
+        super(FreqRDN_Refine, self).__init__()
+        
+        # Initial Feature Extraction
+        self.head = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        
+        # Residual Dense Blocks (RDB)
+        self.body = nn.Sequential(*[ResidualDenseBlock(base_channels, growth_rate) for _ in range(num_blocks)])
+        
+        # Global Feature Fusion (GFF)
+        self.gff = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
-        self.cbam = CBAM(out_channels)
+        
+        # Frequency-Aware Branches (Tail)
+        self.tail_LH = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
+        )
+        self.tail_HL = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
+        )
+        self.tail_HH = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels // 2, 1, kernel_size=3, padding=1)
+        )
 
     def forward(self, x):
-        x = self.double_conv(x)
-        x = self.cbam(x)
-        return x
-
-class FreqUNet(nn.Module):
-    def __init__(self, in_channels=8, out_channels=3):
-        super(FreqUNet, self).__init__()
+        # Extract features
+        feat = self.head(x)
         
-        # 깊이(Depth) 4 + CBAM Attention
+        # Deep mapping with dense connections
+        res = self.body(feat)
+        res = self.gff(res)
+        res = res + feat # Global feature skip connection
         
-        # 인코더 (Downsampling)
-        self.inc = DoubleConv(in_channels, 64)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
-        self.down4 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(512, 1024))
+        # Frequency-aware reconstruction
+        out_LH = self.tail_LH(res)
+        out_HL = self.tail_HL(res)
+        out_HH = self.tail_HH(res)
         
-        # 디코더 (Upsampling)
-        self.up1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.conv1 = DoubleConv(1024, 512) # skip connection 512 + 512
+        # For Scenario 2, the target itself is the residual difference (HR_HF - SR_HF).
+        # Therefore, the model's direct output is the predicted residual.
+        # We do not add the input SR_HF here; that addition is handled during inference/reconstruction.
+        out = torch.cat([out_LH, out_HL, out_HH], dim=1)
         
-        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.conv2 = DoubleConv(512, 256)  # skip connection 256 + 256
-        
-        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.conv3 = DoubleConv(256, 128)  # skip connection 128 + 128
-        
-        self.up4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv4 = DoubleConv(128, 64)   # skip connection 64 + 64
-        
-        # 마지막 출력층
-        self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # 인코딩
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        
-        # 디코딩
-        x = self.up1(x5)
-        x = torch.cat([x4, x], dim=1) # Skip connection
-        x = self.conv1(x)
-        
-        x = self.up2(x)
-        x = torch.cat([x3, x], dim=1) # Skip connection
-        x = self.conv2(x)
-        
-        x = self.up3(x)
-        x = torch.cat([x2, x], dim=1) # Skip connection
-        x = self.conv3(x)
-        
-        x = self.up4(x)
-        x = torch.cat([x1, x], dim=1) # Skip connection
-        x = self.conv4(x)
-        
-        output = self.outc(x)
-        return output
+        return out
 
 if __name__ == "__main__":
     # 구조 테스트
-    model = FreqUNet(in_channels=8, out_channels=3)
+    model = FreqRDN_Refine(in_channels=8, out_channels=3)
     dummy_input = torch.randn(2, 8, 128, 128)
     output = model(dummy_input)
     print(f"Input shape: {dummy_input.shape}")
     print(f"Output shape: {output.shape}")
-    print("FreqUNet (CBAM + Depth 4) 구조 정상!")
+    print("FreqRDN_Refine 구조 정상!")
